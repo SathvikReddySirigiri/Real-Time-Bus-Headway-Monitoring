@@ -1,0 +1,213 @@
+# Final Project Docker Compose Configuration
+# Technology: Kafka, Zookeeper, Spark, MongoDB, Jupyter Notebook
+
+version: "3.8"
+
+services:
+  # ===========================
+  # Service 1: zookeeper
+  # Purpose: For Kafka coordination
+  # ===========================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    hostname: zookeeper
+    ports:
+      - "2181:2181"
+    networks:
+      - headway-network
+    environment:
+      - ZOOKEEPER_CLIENT_PORT=2181
+      - ZOOKEEPER_SERVER_ID=1
+      - ZOOKEEPER_TICK_TIME=2000
+      - ZOOKEEPER_STANDALONE_ENABLED=true
+    healthcheck:
+      test: ["CMD-SHELL", "echo srvr | nc -w 2 localhost 2181 | grep Mode"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # ===========================
+  # Service 2: Kafka
+  # Purpose: For message brokering
+  # ===========================
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Internal listener for service-to-service communication
+      KAFKA_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://0.0.0.0:9092
+      # Advertise INTERNAL listener using its service name and EXTERNAL listener using localhost
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL # Use the internal listener for communication within the network
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1",
+        ]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    networks:
+      - headway-network
+    depends_on:
+      zookeeper:
+        condition: service_healthy # Wait for ZK to be healthy
+
+  # ===========================
+  # Service 3: spark-master
+  # Purpose: For spark workers cluster management
+  # ===========================
+  spark-master:
+    image: apache/spark:3.5.0
+    container_name: spark-master
+    hostname: spark-master
+    ports:
+      - "8080:8080" # Spark Web UI
+      - "7077:7077" # Spark Master Port
+      # The 4040 port is dynamic and usually opened when jobs run. Omit exposing it.
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    volumes:
+      - ./data:/data
+      - ./notebooks:/notebooks
+      - spark-logs:/opt/spark/logs # Volume name changed to lowercase
+    networks:
+      - headway-network
+
+  # ===========================
+  # Service 4: spark-worker-1
+  # Purpose: For processing tasks
+  # ===========================
+  spark-worker-1:
+    image: apache/spark:3.5.0
+    container_name: spark-worker-1
+    hostname: spark-worker-1
+    user: root
+    # Ports are not needed for workers unless for debugging
+    # ports:
+    #   - "8081:8081"
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_WEBUI_PORT=8081 # Set UI port to distinguish from worker-2
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    volumes:
+      - ./data:/data
+      - spark-worker1-work:/opt/spark/work # Volume name changed to lowercase
+    networks:
+      - headway-network
+    depends_on:
+      - spark-master
+
+  # ===========================
+  # Service 5: spark-worker-2
+  # Purpose: For processing tasks
+  # ===========================
+  spark-worker-2:
+    image: apache/spark:3.5.0
+    container_name: spark-worker-2
+    hostname: spark-worker-2
+    user: root
+    # Ports are not needed for workers unless for debugging
+    # ports:
+    #   - "8082:8082"
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_WEBUI_PORT=8082 # Set UI port to distinguish from worker-1
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    volumes:
+      - ./data:/data
+      - spark-worker2-work:/opt/spark/work # Volume name changed to lowercase
+    networks:
+      - headway-network
+    depends_on:
+      - spark-master
+
+  # ===========================
+  # Service 6: mongo
+  # Purpose: For data storage
+  # ===========================
+  mongo:
+    image: mongo:latest
+    container_name: mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=password
+    healthcheck:
+      test:
+        ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - headway-network
+
+  # ===========================
+  # Service 7: Jupyter
+  # Purpose: For interactive data analysis
+  # ===========================
+  jupyter:
+    image: jupyter/pyspark-notebook:spark-3.5.0
+    container_name: spark-jupyter
+    hostname: jupyter
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./data:/data
+      - jupyter-home:/home/jovyan
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - SPARK_MASTER=spark://spark-master:7077
+      - PYSPARK_SUBMIT_ARGS=--packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.mongodb.spark:mongo-spark-connector_2.12:10.2.0 pyspark-shell
+    command: start-notebook.sh --NotebookApp.token='spark' --NotebookApp.password=''
+    networks:
+      - headway-network
+    depends_on:
+      kafka:
+        condition: service_started
+      spark-master:
+        condition: service_started
+      mongo:
+        condition: service_healthy
+
+# ===========================
+# Define Network and Volumes
+# ===========================
+
+networks:
+  headway-network:
+    name: headway-network
+    driver: bridge
+
+volumes:
+  mongo-data:
+  spark-logs:
+  spark-worker1-work:
+  spark-worker2-work:
+  jupyter-home:
